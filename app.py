@@ -1,10 +1,14 @@
 from flask import Flask, render_template, request, redirect, session, flash, url_for
 import mysql.connector
 from werkzeug.security import generate_password_hash, check_password_hash
+import secrets
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
 app = Flask(__name__)
-app.secret_key = "myverysecretkey"  
+app.secret_key = "myverysecretkey"
 
 
 def get_db_connection():
@@ -14,16 +18,15 @@ def get_db_connection():
     """
     conn = mysql.connector.connect(
         host="localhost",
-        user="root",      
-        password="2851",       
-        database="notesdb" 
+        user="root",
+        password="2851",
+        database="notesdb"
     )
     return conn
 
 
 @app.route('/')
 def home():
-    
     if 'user_id' in session:
         return redirect('/viewall')
     return redirect('/login')
@@ -113,6 +116,64 @@ def logout():
     flash("You have been logged out.", "info")
     return redirect('/login')
 
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form['email']
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        if result:
+            # Generate a reset token
+            reset_token = secrets.token_urlsafe(32)
+            # Store the token in session or database (for simplicity, using session)
+            session['reset_token'] = reset_token
+            session['reset_email'] = email
+
+            # Send email with reset link
+            reset_link = url_for('reset_password', token=reset_token, _external=True)
+            send_reset_email(email, reset_link)
+            flash('A password reset link has been sent to your email.', 'info')
+            return redirect('/login')
+        else:
+            flash('Email not found.', 'error')
+            return render_template('forgot_password.html')
+    return render_template('forgot_password.html')
+
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    if 'reset_token' not in session or session['reset_token'] != token:
+        flash('Invalid or expired reset token.', 'error')
+        return redirect('/login')
+
+    if request.method == 'POST':
+        new_password = request.form['new_password']
+        confirm_password = request.form['confirm_password']
+        if new_password != confirm_password:
+            flash('Passwords do not match.', 'error')
+            return render_template('reset_password.html')
+
+        hashed_password = generate_password_hash(new_password)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET password=%s WHERE email=%s", (hashed_password, session['reset_email']))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Clear session
+        session.pop('reset_token', None)
+        session.pop('reset_email', None)
+        flash('Password has been reset successfully.', 'success')
+        return redirect('/login')
+    return render_template('reset_password.html')
+
+
 @app.route('/addnote', methods=['GET', 'POST'])
 def addnote():
     # Ensure user is logged in
@@ -152,15 +213,21 @@ def viewall():
         return redirect('/login')
 
     user_id = session['user_id']
+    search_query = request.args.get('search', '').strip()
+
     conn = get_db_connection()
     cur = conn.cursor(dictionary=True)
-    # Fetch only notes that belong to this user
-    cur.execute("SELECT id, title, content, created_at FROM notes WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+    if search_query:
+        # Search in title or content
+        cur.execute("SELECT id, title, content, created_at FROM notes WHERE user_id = %s AND (title LIKE %s OR content LIKE %s) ORDER BY created_at DESC", (user_id, f'%{search_query}%', f'%{search_query}%'))
+    else:
+        # Fetch only notes that belong to this user
+        cur.execute("SELECT id, title, content, created_at FROM notes WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
     notes = cur.fetchall()
     cur.close()
     conn.close()
 
-    return render_template('viewnotes.html', notes=notes)
+    return render_template('viewnotes.html', notes=notes, search_query=search_query)
 
 
 @app.route('/viewnotes/<int:note_id>')
@@ -243,6 +310,30 @@ def deletenote(note_id):
     conn.close()
     flash("Note deleted.", "info")
     return redirect('/viewall')
+
+
+def send_reset_email(to_email, reset_link):
+    smtp_server = 'smtp.gmail.com'
+    smtp_port = 587
+    sender_email = 'yasajagan@gmail.com'  # Replace with your email
+    sender_password = 'okpg iczw hmir gnpn'  # Replace with your app password
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = to_email
+    msg['Subject'] = 'Password Reset Request'
+
+    body = f'Click the following link to reset your password: {reset_link}'
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        text = msg.as_string()
+        server.sendmail(sender_email, to_email, text)
+        server.quit()
+    except Exception as e:
+        print(f'Failed to send email: {e}')
 
 
 if __name__ == '__main__':
